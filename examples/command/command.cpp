@@ -8,6 +8,7 @@
 
 #include "common-sdl.h"
 #include "common.h"
+#include "common-whisper.h"
 #include "whisper.h"
 #include "grammar-parser.h"
 
@@ -47,6 +48,7 @@ struct whisper_params {
     std::string language  = "en";
     std::string model     = "models/ggml-base.en.bin";
     std::string fname_out;
+    std::string fname_inp; // 新增：输入音频文件
     std::string commands;
     std::string prompt;
     std::string context;
@@ -83,6 +85,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-l"     || arg == "--language")      { params.language      = argv[++i]; }
         else if (arg == "-m"     || arg == "--model")         { params.model         = argv[++i]; }
         else if (arg == "-f"     || arg == "--file")          { params.fname_out     = argv[++i]; }
+        else if (arg == "-i"     || arg == "--input")         { params.fname_inp     = argv[++i]; }
         else if (arg == "-cmd"   || arg == "--commands")      { params.commands      = argv[++i]; }
         else if (arg == "-p"     || arg == "--prompt")        { params.prompt        = argv[++i]; }
         else if (arg == "-ctx"   || arg == "--context")       { params.context       = argv[++i]; }
@@ -122,6 +125,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -l LANG,    --language LANG  [%-7s] spoken language\n",                             params.language.c_str());
     fprintf(stderr, "  -m FNAME,   --model FNAME    [%-7s] model path\n",                                  params.model.c_str());
     fprintf(stderr, "  -f FNAME,   --file FNAME     [%-7s] text output file name\n",                       params.fname_out.c_str());
+    fprintf(stderr, "  -i FNAME,   --input-file     [%-7s] input audio file (WAV/PCM) to process\n",       params.fname_inp.c_str());
     fprintf(stderr, "  -cmd FNAME, --commands FNAME [%-7s] text file with allowed commands\n",             params.commands.c_str());
     fprintf(stderr, "  -p,         --prompt         [%-7s] the required activation prompt\n",              params.prompt.c_str());
     fprintf(stderr, "  -ctx,       --context        [%-7s] sample text to help the transcription\n",       params.context.c_str());
@@ -736,8 +740,159 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "\n");
     }
 
-    // init audio
+    // ===== 文件模式处理 =====
+    if (!params.fname_inp.empty()) {
+        // 读取音频文件
+        std::vector<float> pcmf32;
+        std::vector<std::vector<float>> pcmf32s;
+        if (!read_audio_data(params.fname_inp, pcmf32, pcmf32s, false)) {
+            fprintf(stderr, "error: failed to read audio file '%s'\n", params.fname_inp.c_str());
+            return 1;
+        }
+        if (pcmf32.empty()) {
+            fprintf(stderr, "error: audio data is empty\n");
+            return 1;
+        }
 
+        // 检查命令列表
+        if (params.commands.empty()) {
+            fprintf(stderr, "error: --commands required for file mode\n");
+            return 1;
+        }
+        std::vector<std::string> allowed_commands = read_allowed_commands(params.commands);
+        if (allowed_commands.empty()) {
+            fprintf(stderr, "error: failed to read allowed commands from '%s'\n", params.commands.c_str());
+            return 1;
+        }
+
+        // 构建命令 token 序列
+        int max_len = 0;
+        std::vector<std::vector<whisper_token>> allowed_tokens;
+
+        for (const auto & cmd : allowed_commands) {
+            whisper_token tokens[1024];
+            allowed_tokens.emplace_back();
+
+            for (int l = 0; l < (int) cmd.size(); ++l) {
+                std::string ss = std::string(" ") + cmd.substr(0, l + 1);
+                const int n = whisper_tokenize(ctx, ss.c_str(), tokens, 1024);
+                if (n < 0) {
+                    fprintf(stderr, "error: failed to tokenize command '%s'\n", cmd.c_str());
+                    return 1;
+                }
+                if (n == 1) {
+                    allowed_tokens.back().push_back(tokens[0]);
+                }
+            }
+
+            // 安全检查：确保每个命令至少有一个 token
+            if (allowed_tokens.back().empty()) {
+                fprintf(stderr, "error: command '%s' has no valid tokens\n", cmd.c_str());
+                return 1;
+            }
+            max_len = std::max(max_len, (int) cmd.size());
+        }
+
+        // 构建提示词 token
+        std::string k_prompt = "select one from the available words: ";
+        for (size_t i = 0; i < allowed_commands.size(); ++i) {
+            if (i > 0) k_prompt += ", ";
+            k_prompt += allowed_commands[i];
+        }
+        k_prompt += ". selected word: ";
+
+        std::vector<whisper_token> k_tokens(1024);
+        int n = whisper_tokenize(ctx, k_prompt.c_str(), k_tokens.data(), k_tokens.size());
+        if (n < 0) {
+            fprintf(stderr, "error: failed to tokenize prompt\n");
+            return 1;
+        }
+        k_tokens.resize(n);
+        if (k_tokens.empty()) {
+            fprintf(stderr, "error: prompt tokenization resulted in empty tokens\n");
+            return 1;
+        }
+
+        // 设置解码参数
+        whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+        wparams.print_progress   = false;
+        wparams.print_special    = params.print_special;
+        wparams.print_realtime   = false;
+        wparams.print_timestamps = !params.no_timestamps;
+        wparams.translate        = params.translate;
+        wparams.no_context       = true;
+        wparams.single_segment   = true;
+        wparams.max_tokens       = 1;
+        wparams.language         = params.language.c_str();
+        wparams.n_threads        = params.n_threads;
+        wparams.audio_ctx        = params.audio_ctx;
+        wparams.prompt_tokens    = k_tokens.data();
+        wparams.prompt_n_tokens  = k_tokens.size();
+
+        // 运行解码
+        if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
+            fprintf(stderr, "error: whisper_full failed\n");
+            return 1;
+        }
+
+        // 计算命令概率
+        const auto * logits = whisper_get_logits(ctx);
+        std::vector<float> probs(whisper_n_vocab(ctx), 0.0f);
+
+        // softmax
+        {
+            float max = -1e9;
+            for (int i = 0; i < (int) probs.size(); ++i) {
+                max = std::max(max, logits[i]);
+            }
+            float sum = 0.0f;
+            for (int i = 0; i < (int) probs.size(); ++i) {
+                probs[i] = expf(logits[i] - max);
+                sum += probs[i];
+            }
+            for (int i = 0; i < (int) probs.size(); ++i) {
+                probs[i] /= sum;
+            }
+        }
+
+        // 计算每个命令的平均概率
+        std::vector<std::pair<float, int>> probs_id;
+        double psum = 0.0;
+        for (int i = 0; i < (int) allowed_commands.size(); ++i) {
+            // 确保 allowed_tokens[i] 非空（已在前面的检查中保证）
+            float prob = probs[allowed_tokens[i][0]];
+            for (int j = 1; j < (int) allowed_tokens[i].size(); ++j) {
+                prob += probs[allowed_tokens[i][j]];
+            }
+            prob /= allowed_tokens[i].size();
+            probs_id.emplace_back(prob, i);
+            psum += prob;
+        }
+
+        // 归一化
+        for (auto & p : probs_id) {
+            p.first /= psum;
+        }
+
+        // 排序
+        std::sort(probs_id.begin(), probs_id.end(),
+                [](const std::pair<float, int> & a, const std::pair<float, int> & b) {
+                    return a.first > b.first;
+                });
+
+        // 输出最佳命令
+        if (!probs_id.empty()) {
+            const int index = probs_id[0].second;
+            const std::string & best_command = allowed_commands[index];
+            fprintf(stdout, "detected command: %s (prob: %f)\n", best_command.c_str(), probs_id[0].first);
+        } else {
+            fprintf(stderr, "no command detected\n");
+        }
+
+        whisper_free(ctx);
+        return 0;
+    }
+    // init audio
     audio_async audio(30*1000);
     if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
         fprintf(stderr, "%s: audio.init() failed!\n", __func__);
