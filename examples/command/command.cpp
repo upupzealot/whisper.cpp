@@ -884,6 +884,19 @@ int main(int argc, char ** argv) {
         if (!probs_id.empty()) {
             const int index = probs_id[0].second;
             const std::string & best_command = allowed_commands[index];
+
+            {
+                fprintf(stdout, "\n");
+                for (const auto & cmd : probs_id) {
+                    int idx = cmd.second;
+                    const std::string & command = allowed_commands[idx];
+                    const float prob = cmd.first;
+                    // 输出命令名和概率，格式与麦克风模式类似
+                    fprintf(stdout, "- %s = %f | ", command.c_str(), prob);
+                    fprintf(stdout, "\n");
+                }
+            }
+
             fprintf(stdout, "detected command: %s (prob: %f)\n", best_command.c_str(), probs_id[0].first);
         } else {
             fprintf(stderr, "no command detected\n");
